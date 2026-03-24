@@ -37,7 +37,31 @@ interface LogsConfig {
   "bans-deban"?: string; "mute-unmute"?: string; messages?: string; "proposition-stream"?: string;
   "joins-leaves"?: string; "role-changes"?: string;
 }
-interface ServerConfig { roles: RolesConfig; logs: LogsConfig; }
+type PermCmdMap = Record<string, number>; // cmd -> perm level requis
+
+interface ServerConfig { roles: RolesConfig; logs: LogsConfig; permcmds: PermCmdMap; }
+
+// Permissions par défaut des commandes
+const DEFAULT_PERM_CMDS: PermCmdMap = {
+  "warn": 1, "unwarn": 1, "warnlist": 1, "mute": 1, "tempmute": 1, "unmute": 1,
+  "kick": 2, "ban": 2, "unban": 2, "banlist": 2,
+  "clear": 3, "rank": 3, "derank": 3, "slowmode": 3,
+  "lock": 4, "unlock": 4, "renew": 4, "bl": 4, "unbl": 4, "blcheck": 4,
+  "wl": 4, "backup": 4, "maintenance": 4, "lockdown": 4, "unlockdown": 4,
+  "massban": 4, "clearinvites": 4,
+  "createembed": 4, "embed": 4, "modifembed": 4, "deleteembed": 4, "listembeds": 4,
+  "createticket": 4, "ticket": 4, "modifticket": 4, "deleteticket": 4, "listtickets": 4,
+  "antilink": 6, "antispam": 6, "antiraid": 6, "antiraid-reset": 6,
+  "antiaddbot": 6, "antimentionspam": 6,
+  "setrole": 6, "setlog": 6, "config": 6, "logs": 6, "addlogs": 6, "deletelogs": 6, "modiflogs": 6,
+  "owner": 6,
+};
+
+function getCmdPerm(cmd: string): number {
+  const cfg = getServerConfig();
+  const map = { ...DEFAULT_PERM_CMDS, ...(cfg.permcmds ?? {}) };
+  return map[cmd] ?? 0;
+}
 
 const LOG_TYPES: (keyof LogsConfig)[] = ["logs","tickets-deban","roles","bl","bans-deban","mute-unmute","messages","proposition-stream","joins-leaves","role-changes"];
 const LOG_LABELS: Record<string, string> = {
@@ -51,8 +75,8 @@ const SERVER_CONFIG_FILE = join(DATA_DIR, "server-config.json");
 function ensureDataDir(): void { if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true }); }
 function getServerConfig(): ServerConfig {
   ensureDataDir();
-  if (!existsSync(SERVER_CONFIG_FILE)) return { roles: {}, logs: {} };
-  try { return JSON.parse(readFileSync(SERVER_CONFIG_FILE, "utf-8")) as ServerConfig; } catch { return { roles: {}, logs: {} }; }
+  if (!existsSync(SERVER_CONFIG_FILE)) return { roles: {}, logs: {}, permcmds: {} };
+  try { const d = JSON.parse(readFileSync(SERVER_CONFIG_FILE, "utf-8")) as ServerConfig; return { roles: d.roles ?? {}, logs: d.logs ?? {}, permcmds: d.permcmds ?? {} }; } catch { return { roles: {}, logs: {}, permcmds: {} }; }
 }
 function saveServerConfig(cfg: ServerConfig): void {
   ensureDataDir();
@@ -224,6 +248,9 @@ function buildHelpPages(): EmbedBuilder[] {
     .addFields(
       { name: "+setrole <1-6> @rôle", value: "Associer un rôle à un niveau (1=Helpeur, 2=Modo, 3=Chef Modo, 4=Responsable, 5=Co Owner, 6=Paix).\nEx : `+setrole 2 @Modo`", inline: false },
       { name: "+perm", value: "Voir les rôles associés à chaque niveau.", inline: false },
+      { name: "+permission", value: "Voir le récapitulatif complet : qui a quel rôle et quelles commandes.", inline: false },
+      { name: "+setpermcmd <commande> <niveau>", value: "Modifier le niveau de perm requis pour une commande.\nEx : `+setpermcmd warn 2`", inline: false },
+      { name: "+resetpermcmd <commande>", value: "Remettre une commande à sa permission par défaut.", inline: false },
       { name: "+config", value: "Voir la configuration complète.", inline: false },
       { name: "+owner add @personne", value: "Ajouter un owner (perm 5 permanente).", inline: false },
       { name: "+owner remove @personne  |  +owner list", value: "Retirer / lister les owners.", inline: false },
@@ -571,6 +598,63 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
     return;
   }
 
+  // ── +setpermcmd <commande> <niveau> ───────────────────────────────────────
+  if (cmd === "setpermcmd") {
+    if (permLevel < 6) { await noPerm(); return; }
+    const targetCmd = args[0]?.toLowerCase();
+    const niveau = parseInt(args[1] ?? "", 10);
+    if (!targetCmd || isNaN(niveau) || niveau < 0 || niveau > 6) {
+      await message.reply({ embeds: [errEmbed("Usage : `+setpermcmd <commande> <niveau 0-6>`\nEx : `+setpermcmd warn 2` pour que warn nécessite perm 2")] });
+      return;
+    }
+    if (!(targetCmd in DEFAULT_PERM_CMDS)) {
+      await message.reply({ embeds: [errEmbed(`Commande **${targetCmd}** introuvable.\nUtilise \`+permission\` pour voir les commandes disponibles.`)] });
+      return;
+    }
+    const cfg = getServerConfig();
+    cfg.permcmds[targetCmd] = niveau;
+    saveServerConfig(cfg);
+    await message.reply({ embeds: [successEmbed(`Commande **+${targetCmd}** → perm **${niveau}** requis.`)] });
+    return;
+  }
+
+  // ── +resetpermcmd <commande> ───────────────────────────────────────────────
+  if (cmd === "resetpermcmd") {
+    if (permLevel < 6) { await noPerm(); return; }
+    const targetCmd = args[0]?.toLowerCase();
+    if (!targetCmd) { await message.reply({ embeds: [errEmbed("Usage : `+resetpermcmd <commande>`")] }); return; }
+    const cfg = getServerConfig();
+    delete cfg.permcmds[targetCmd];
+    saveServerConfig(cfg);
+    const defaut = DEFAULT_PERM_CMDS[targetCmd] ?? 0;
+    await message.reply({ embeds: [successEmbed(`Commande **+${targetCmd}** remise à la perm par défaut (**${defaut}**).`)] });
+    return;
+  }
+
+  // ── +permission ────────────────────────────────────────────────────────────
+  if (cmd === "permission") {
+    const cfg = getServerConfig();
+    const activeMap = { ...DEFAULT_PERM_CMDS, ...(cfg.permcmds ?? {}) };
+    const r = (n: number) => { const id = cfg.roles[`perm${n}` as keyof RolesConfig]; return id ? `<@&${id}>` : "*(non configuré)*"; };
+    const cmdsForLevel = (n: number) => Object.entries(activeMap).filter(([,v]) => v === n).map(([k]) => `+${k}`).join(", ") || "*(aucune)*";
+    const hasCustom = Object.keys(cfg.permcmds ?? {}).length > 0;
+    const embed = new EmbedBuilder().setColor(COLOR.purple)
+      .setTitle("🔑 Permissions — Récapitulatif")
+      .addFields(
+        { name: `🟢 Perm 1 — ${r(1)}`, value: cmdsForLevel(1), inline: false },
+        { name: `🔵 Perm 2 — ${r(2)}`, value: cmdsForLevel(2), inline: false },
+        { name: `🟡 Perm 3 — ${r(3)}`, value: cmdsForLevel(3), inline: false },
+        { name: `🔴 Perm 4 — ${r(4)}`, value: cmdsForLevel(4), inline: false },
+        { name: `🟠 Perm 5 — ${r(5)}`, value: cmdsForLevel(5) === "*(aucune)*" ? "*(niveau intermédiaire)*" : cmdsForLevel(5), inline: false },
+        { name: `⚫ Perm 6 — ${r(6)} — Owner auto`, value: cmdsForLevel(6), inline: false },
+        { name: "⬜ Tout le monde", value: "+help, +perm, +permission", inline: false },
+      )
+      .setFooter({ text: hasCustom ? "⚠️ Permissions personnalisées actives • +resetpermcmd <cmd> pour remettre par défaut" : "Défauts actifs • +setpermcmd <cmd> <1-6> pour modifier" })
+      .setTimestamp();
+    await message.reply({ embeds: [embed] });
+    return;
+  }
+
   // ── +perm ──────────────────────────────────────────────────────────────────
   if (cmd === "perm") {
     const cfg = getServerConfig();
@@ -657,7 +741,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +warn ──────────────────────────────────────────────────────────────────
   if (cmd === "warn") {
-    if (permLevel < 1) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("warn")) { await noPerm(); return; }
     const target = message.mentions.users.first();
     if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+warn @membre [raison]`")] }); return; }
     const raison = args.slice(1).join(" ") || "Aucune raison fournie";
@@ -672,7 +756,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +unwarn ────────────────────────────────────────────────────────────────
   if (cmd === "unwarn") {
-    if (permLevel < 1) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("unwarn")) { await noPerm(); return; }
     const target = message.mentions.users.first();
     if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+unwarn @membre [id]`")] }); return; }
     const warnId = args[1];
@@ -691,7 +775,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +warnlist ──────────────────────────────────────────────────────────────
   if (cmd === "warnlist") {
-    if (permLevel < 1) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("warnlist")) { await noPerm(); return; }
     const target = message.mentions.users.first();
     if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+warnlist @membre`")] }); return; }
     const warns = getWarnings(target.id);
@@ -704,7 +788,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +mute @membre [raison] — mute permanent ───────────────────────────────
   if (cmd === "mute") {
-    if (permLevel < 1) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("mute")) { await noPerm(); return; }
     const target = message.mentions.users.first();
     if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+mute @membre [raison]`")] }); return; }
     const raison = args.slice(1).join(" ") || "Aucune raison fournie";
@@ -720,7 +804,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +tempmute @membre <durée> <s|m|h|j> [raison] — mute temporaire ────────
   if (cmd === "tempmute") {
-    if (permLevel < 1) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("tempmute")) { await noPerm(); return; }
     const target = message.mentions.users.first();
     if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+tempmute @membre <durée> <s|m|h|j> [raison]`\nEx : `+tempmute @user 10 m Spam`")] }); return; }
     const valeur = parseInt(args[1] ?? "", 10);
@@ -743,7 +827,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +unmute ────────────────────────────────────────────────────────────────
   if (cmd === "unmute") {
-    if (permLevel < 1) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("unmute")) { await noPerm(); return; }
     const target = message.mentions.users.first();
     if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+unmute @membre`")] }); return; }
     const member = await guild.members.fetch(target.id).catch(() => null);
@@ -756,7 +840,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +kick ──────────────────────────────────────────────────────────────────
   if (cmd === "kick") {
-    if (permLevel < 2) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("kick")) { await noPerm(); return; }
     const target = message.mentions.users.first();
     if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+kick @membre [raison]`")] }); return; }
     const raison = args.slice(1).join(" ") || "Aucune raison fournie";
@@ -770,7 +854,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +ban ───────────────────────────────────────────────────────────────────
   if (cmd === "ban") {
-    if (permLevel < 2) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("ban")) { await noPerm(); return; }
     const target = message.mentions.users.first();
     if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+ban @membre [raison]`")] }); return; }
     const raison = args.slice(1).join(" ") || "Aucune raison fournie";
@@ -784,7 +868,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +unban ─────────────────────────────────────────────────────────────────
   if (cmd === "unban") {
-    if (permLevel < 2) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("unban")) { await noPerm(); return; }
     const id = args[0];
     if (!id) { await message.reply({ embeds: [errEmbed("Usage : `+unban <id> [raison]`")] }); return; }
     const raison = args.slice(1).join(" ") || "Aucune raison fournie";
@@ -798,7 +882,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +banlist ───────────────────────────────────────────────────────────────
   if (cmd === "banlist") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("banlist")) { await noPerm(); return; }
     const bans = await guild.bans.fetch().catch(() => new Collection());
     if (bans.size === 0) { await message.reply({ embeds: [okEmbed("🔨 Bans", "Aucun ban actif.")] }); return; }
     const desc = [...bans.values()].slice(0,20).map((b,i) => `**${i+1}.** ${b.user.tag} (\`${b.user.id}\`)\n> ${b.reason ?? "Aucune raison"}`).join("\n\n");
@@ -808,7 +892,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +clear ─────────────────────────────────────────────────────────────────
   if (cmd === "clear") {
-    if (permLevel < 3) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("clear")) { await noPerm(); return; }
     const nombre = parseInt(args[0] ?? "", 10);
     if (isNaN(nombre) || nombre < 1 || nombre > 100) { await message.reply({ embeds: [errEmbed("Usage : `+clear <1-100> [@membre]`")] }); return; }
     const targetUser = message.mentions.users.first();
@@ -824,7 +908,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +rank ──────────────────────────────────────────────────────────────────
   if (cmd === "rank") {
-    if (permLevel < 3) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("rank")) { await noPerm(); return; }
     const target = message.mentions.members?.first();
     const role = message.mentions.roles.first();
     if (!target || !role) { await message.reply({ embeds: [errEmbed("Usage : `+rank @membre @rôle`")] }); return; }
@@ -837,7 +921,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +derank ────────────────────────────────────────────────────────────────
   if (cmd === "derank") {
-    if (permLevel < 3) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("derank")) { await noPerm(); return; }
     const target = message.mentions.members?.first();
     const role = message.mentions.roles.first();
     if (!target || !role) { await message.reply({ embeds: [errEmbed("Usage : `+derank @membre @rôle`")] }); return; }
@@ -850,7 +934,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +lock ──────────────────────────────────────────────────────────────────
   if (cmd === "lock") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("lock")) { await noPerm(); return; }
     const targetChan = (message.mentions.channels.first() as TextChannel | undefined) ?? message.channel as TextChannel;
     const raison = args.filter(a => !a.startsWith("<")).join(" ") || "Aucune raison fournie";
     await targetChan.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false });
@@ -861,7 +945,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +unlock ────────────────────────────────────────────────────────────────
   if (cmd === "unlock") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("unlock")) { await noPerm(); return; }
     const targetChan = (message.mentions.channels.first() as TextChannel | undefined) ?? message.channel as TextChannel;
     await targetChan.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: null });
     await message.reply({ embeds: [successEmbed(`🔓 **#${targetChan.name}** déverrouillé.`)] });
@@ -871,7 +955,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +renew ─────────────────────────────────────────────────────────────────
   if (cmd === "renew") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("renew")) { await noPerm(); return; }
     const channel = message.channel as TextChannel;
     const raison = args.join(" ") || "Aucune raison fournie";
     const { name, parent, topic, nsfw, position } = channel;
@@ -888,7 +972,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +bl ────────────────────────────────────────────────────────────────────
   if (cmd === "bl") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("bl")) { await noPerm(); return; }
     const target = message.mentions.users.first();
     if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+bl @membre [raison]`")] }); return; }
     const raison = args.slice(1).join(" ") || "Aucune raison fournie";
@@ -902,7 +986,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +unbl ──────────────────────────────────────────────────────────────────
   if (cmd === "unbl") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("unbl")) { await noPerm(); return; }
     const id = args[0];
     if (!id) { await message.reply({ embeds: [errEmbed("Usage : `+unbl <id>`")] }); return; }
     const removed = removeFromBlacklist(id);
@@ -914,7 +998,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +blcheck ───────────────────────────────────────────────────────────────
   if (cmd === "blcheck") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("blcheck")) { await noPerm(); return; }
     const list = getBlacklist();
     if (list.length === 0) { await message.reply({ embeds: [okEmbed("🚫 Blacklist", "La blacklist est vide.")] }); return; }
     const desc = list.map((e,i) => `**${i+1}.** ${e.tag} (\`${e.id}\`)\n> ${e.raison} — par ${e.addedBy}`).join("\n\n");
@@ -924,7 +1008,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +wl ────────────────────────────────────────────────────────────────────
   if (cmd === "wl") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("wl")) { await noPerm(); return; }
     const sub = args[0]?.toLowerCase();
     if (sub === "add") {
       const target = message.mentions.users.first();
@@ -951,7 +1035,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +backup ────────────────────────────────────────────────────────────────
   if (cmd === "backup") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("backup")) { await noPerm(); return; }
     const sub = args[0]?.toLowerCase();
     if (sub === "create") {
       const backup = createBackup(guild, message.author.tag);
@@ -971,7 +1055,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +maintenance ───────────────────────────────────────────────────────────
   if (cmd === "maintenance") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("maintenance")) { await noPerm(); return; }
     const statut = args[0]?.toLowerCase();
     if (statut !== "on" && statut !== "off") { await message.reply({ embeds: [errEmbed("Usage : `+maintenance on|off [message]`")] }); return; }
     const on = statut === "on";
@@ -1037,7 +1121,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +slowmode #salon <secondes> ───────────────────────────────────────────
   if (cmd === "slowmode") {
-    if (permLevel < 3) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("slowmode")) { await noPerm(); return; }
     const targetChan = (message.mentions.channels.first() as TextChannel | undefined) ?? message.channel as TextChannel;
     const secondes = parseInt(args.find(a => !a.startsWith("<")) ?? "", 10);
     if (isNaN(secondes) || secondes < 0 || secondes > 21600) { await message.reply({ embeds: [errEmbed("Usage : `+slowmode [#salon] <0-21600>`
@@ -1050,7 +1134,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +lockdown [raison] ────────────────────────────────────────────────────
   if (cmd === "lockdown") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("lockdown")) { await noPerm(); return; }
     const raison = args.join(" ") || "Lockdown d'urgence";
     const channels = guild.channels.cache.filter(c => c instanceof TextChannel) as Collection<string, TextChannel>;
     let count = 0;
@@ -1065,7 +1149,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +unlockdown ───────────────────────────────────────────────────────────
   if (cmd === "unlockdown") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("unlockdown")) { await noPerm(); return; }
     const channels = guild.channels.cache.filter(c => c instanceof TextChannel) as Collection<string, TextChannel>;
     let count = 0;
     for (const [, chan] of channels) {
@@ -1079,7 +1163,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +massban <id1> <id2> ... [raison] ─────────────────────────────────────
   if (cmd === "massban") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("massban")) { await noPerm(); return; }
     const ids = args.filter(a => /^\d{17,19}$/.test(a));
     const raison = args.filter(a => !/^\d{17,19}$/.test(a)).join(" ") || "Massban";
     if (ids.length === 0) { await message.reply({ embeds: [errEmbed("Usage : `+massban <id1> <id2> ... [raison]`")] }); return; }
@@ -1095,7 +1179,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +clearinvites ─────────────────────────────────────────────────────────
   if (cmd === "clearinvites") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("clearinvites")) { await noPerm(); return; }
     const invites = await guild.invites.fetch().catch(() => null);
     if (!invites || invites.size === 0) { await message.reply({ embeds: [okEmbed("🔗 Invitations", "Aucune invitation active.")] }); return; }
     let count = 0;
@@ -1110,7 +1194,7 @@ En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")
 
   // ── +antimentionspam on|off [seuil] ───────────────────────────────────────
   if (cmd === "antimentionspam") {
-    if (permLevel < 6) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("antimentionspam")) { await noPerm(); return; }
     const statut = args[0]?.toLowerCase();
     if (statut !== "on" && statut !== "off") { await message.reply({ embeds: [errEmbed("Usage : `+antimentionspam on|off [seuil]`
 Ex: `+antimentionspam on 5`")] }); return; }
@@ -1153,7 +1237,7 @@ Ex: `+antimentionspam on 5`")] }); return; }
 
   // ── +createembed [titre] ───────────────────────────────────────────────────
   if (cmd === "createembed") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("createembed")) { await noPerm(); return; }
     const titre = args.join(" ");
     if (!titre) { await message.reply({ embeds: [errEmbed("Usage : `+createembed [titre]`")] }); return; }
     if (getEmbed(titre)) { await message.reply({ embeds: [errEmbed(`Un embed **${titre}** existe déjà. Utilise \`+modifembed ${titre}\`.`)] }); return; }
@@ -1165,7 +1249,7 @@ Ex: `+antimentionspam on 5`")] }); return; }
 
   // ── +modifembed [titre] ────────────────────────────────────────────────────
   if (cmd === "modifembed") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("modifembed")) { await noPerm(); return; }
     const titre = args.join(" ");
     if (!titre) { await message.reply({ embeds: [errEmbed("Usage : `+modifembed [titre]`")] }); return; }
     const existing = getEmbed(titre);
@@ -1178,7 +1262,7 @@ Ex: `+antimentionspam on 5`")] }); return; }
 
   // ── +embed [titre] — poster ────────────────────────────────────────────────
   if (cmd === "embed") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("embed")) { await noPerm(); return; }
     const titre = args.join(" ");
     if (!titre) { await message.reply({ embeds: [errEmbed("Usage : `+embed [titre]`")] }); return; }
     const entry = getEmbed(titre);
@@ -1208,7 +1292,7 @@ Ex: `+antimentionspam on 5`")] }); return; }
 
   // ── +deleteembed [titre] ───────────────────────────────────────────────────
   if (cmd === "deleteembed") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("deleteembed")) { await noPerm(); return; }
     const titre = args.join(" ");
     if (!titre) { await message.reply({ embeds: [errEmbed("Usage : `+deleteembed [titre]`")] }); return; }
     if (!deleteEmbed(titre)) { await message.reply({ embeds: [errEmbed(`Aucun embed **${titre}** trouvé.`)] }); return; }
@@ -1218,7 +1302,7 @@ Ex: `+antimentionspam on 5`")] }); return; }
 
   // ── +listembeds ────────────────────────────────────────────────────────────
   if (cmd === "listembeds") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("listembeds")) { await noPerm(); return; }
     const list = getAllEmbeds();
     if (list.length === 0) { await message.reply({ embeds: [okEmbed("📋 Embeds", "Aucun embed sauvegardé.")] }); return; }
     await message.reply({ embeds: [new EmbedBuilder().setColor(COLOR.purple).setTitle(`📋 Embeds (${list.length})`).setDescription(list.map((e,i) => `**${i+1}.** \`${e.titre}\` — ${e.pages.length} page(s) — par ${e.createdBy}`).join("\n")).setTimestamp()] });
@@ -1227,7 +1311,7 @@ Ex: `+antimentionspam on 5`")] }); return; }
 
   // ── +createticket [titre] ─────────────────────────────────────────────────
   if (cmd === "createticket") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("createticket")) { await noPerm(); return; }
     const titre = args.join(" ");
     if (!titre) { await message.reply({ embeds: [errEmbed("Usage : `+createticket [titre]`")] }); return; }
     if (getTicket(titre)) { await message.reply({ embeds: [errEmbed(`Un ticket **${titre}** existe déjà. Utilise \`+modifticket ${titre}\`.`)] }); return; }
@@ -1239,7 +1323,7 @@ Ex: `+antimentionspam on 5`")] }); return; }
 
   // ── +modifticket [titre] ──────────────────────────────────────────────────
   if (cmd === "modifticket") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("modifticket")) { await noPerm(); return; }
     const titre = args.join(" ");
     if (!titre) { await message.reply({ embeds: [errEmbed("Usage : `+modifticket [titre]`")] }); return; }
     if (!getTicket(titre)) { await message.reply({ embeds: [errEmbed(`Aucun ticket **${titre}** trouvé.`)] }); return; }
@@ -1251,7 +1335,7 @@ Ex: `+antimentionspam on 5`")] }); return; }
 
   // ── +ticket [titre] — poster ───────────────────────────────────────────────
   if (cmd === "ticket") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("ticket")) { await noPerm(); return; }
     const titre = args.join(" ");
     if (!titre) { await message.reply({ embeds: [errEmbed("Usage : `+ticket [titre]`")] }); return; }
     const entry = getTicket(titre);
@@ -1265,7 +1349,7 @@ Ex: `+antimentionspam on 5`")] }); return; }
 
   // ── +deleteticket [titre] ─────────────────────────────────────────────────
   if (cmd === "deleteticket") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("deleteticket")) { await noPerm(); return; }
     const titre = args.join(" ");
     if (!titre) { await message.reply({ embeds: [errEmbed("Usage : `+deleteticket [titre]`")] }); return; }
     if (!deleteTicket(titre)) { await message.reply({ embeds: [errEmbed(`Aucun ticket **${titre}** trouvé.`)] }); return; }
@@ -1275,7 +1359,7 @@ Ex: `+antimentionspam on 5`")] }); return; }
 
   // ── +listtickets ──────────────────────────────────────────────────────────
   if (cmd === "listtickets") {
-    if (permLevel < 4) { await noPerm(); return; }
+    if (permLevel < getCmdPerm("listtickets")) { await noPerm(); return; }
     const list = getAllTickets();
     if (list.length === 0) { await message.reply({ embeds: [okEmbed("🎫 Tickets", "Aucun ticket sauvegardé.")] }); return; }
     await message.reply({ embeds: [new EmbedBuilder().setColor(COLOR.blue).setTitle(`🎫 Tickets (${list.length})`).setDescription(list.map((t,i) => `**${i+1}.** \`${t.titre}\` — bouton: *${t.bouton}* — par ${t.createdBy}`).join("\n")).setTimestamp()] });
