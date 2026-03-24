@@ -31,18 +31,20 @@ const PREFIX = "+";
 // ══════════════════════════════════════════════════════════════════════════════
 // CONFIG DYNAMIQUE
 // ══════════════════════════════════════════════════════════════════════════════
-interface RolesConfig { perm1?: string; perm2?: string; perm3?: string; perm4?: string; perm5?: string; }
+interface RolesConfig { perm1?: string; perm2?: string; perm3?: string; perm4?: string; perm5?: string; perm6?: string; }
 interface LogsConfig {
   logs?: string; "tickets-deban"?: string; roles?: string; bl?: string;
   "bans-deban"?: string; "mute-unmute"?: string; messages?: string; "proposition-stream"?: string;
+  "joins-leaves"?: string; "role-changes"?: string;
 }
 interface ServerConfig { roles: RolesConfig; logs: LogsConfig; }
 
-const LOG_TYPES: (keyof LogsConfig)[] = ["logs","tickets-deban","roles","bl","bans-deban","mute-unmute","messages","proposition-stream"];
+const LOG_TYPES: (keyof LogsConfig)[] = ["logs","tickets-deban","roles","bl","bans-deban","mute-unmute","messages","proposition-stream","joins-leaves","role-changes"];
 const LOG_LABELS: Record<string, string> = {
   "logs": "📋 Logs général", "tickets-deban": "🎫 Tickets déban", "roles": "🏷️ Logs rôles",
   "bl": "🚫 Logs blacklist", "bans-deban": "🔨 Logs bans/débans",
   "mute-unmute": "🔇 Logs mute/warn", "messages": "💬 Logs messages", "proposition-stream": "📺 Logs propositions",
+  "joins-leaves": "🚪 Logs entrées/sorties", "role-changes": "🏷️ Logs changements de rôles",
 };
 
 const SERVER_CONFIG_FILE = join(DATA_DIR, "server-config.json");
@@ -61,12 +63,12 @@ function saveServerConfig(cfg: ServerConfig): void {
 // PERMISSIONS
 // ══════════════════════════════════════════════════════════════════════════════
 async function getPermLevel(guild: Guild, userId: string): Promise<number> {
-  if (isOwner(userId)) return 5;
+  if (isOwner(userId)) return 6;
   const member = guild.members.cache.get(userId) ?? await guild.members.fetch(userId).catch(() => null);
   if (!member) return 0;
   const cfg = getServerConfig();
   let level = 0;
-  for (const [roleId, lvl] of [[cfg.roles.perm1,1],[cfg.roles.perm2,2],[cfg.roles.perm3,3],[cfg.roles.perm4,4],[cfg.roles.perm5,5]] as [string|undefined,number][]) {
+  for (const [roleId, lvl] of [[cfg.roles.perm1,1],[cfg.roles.perm2,2],[cfg.roles.perm3,3],[cfg.roles.perm4,4],[cfg.roles.perm5,5],[cfg.roles.perm6,6]] as [string|undefined,number][]) {
     if (roleId && member.roles.cache.has(roleId)) level = Math.max(level, lvl);
   }
   return level;
@@ -89,12 +91,25 @@ async function sendLog(guild: Guild, logKey: keyof LogsConfig, embed: EmbedBuild
   if (channel instanceof TextChannel) await channel.send({ embeds: [embed] }).catch(() => null);
 }
 
+// Vérifie si un membre est perm 6 (paix) via son rôle
+async function hasPerm6Role(guild: Guild, userId: string): Promise<boolean> {
+  const cfg = getServerConfig();
+  if (!cfg.roles.perm6) return false;
+  const member = guild.members.cache.get(userId) ?? await guild.members.fetch(userId).catch(() => null);
+  return member?.roles.cache.has(cfg.roles.perm6) ?? false;
+}
+
+// Whitelist étendue : perm 6 (paix) = automatiquement whitelisté
+async function isEffectivelyWhitelisted(guild: Guild, userId: string): Promise<boolean> {
+  return isWhitelisted(userId) || isOwner(userId) || await hasPerm6Role(guild, userId);
+}
+
 function hexToInt(hex: string): number { return parseInt(hex.replace("#",""), 16) || COLOR.blue; }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SESSIONS — création pas à pas d'embeds et tickets
 // ══════════════════════════════════════════════════════════════════════════════
-type EmbedStep = "titre_page" | "texte_page" | "image_page" | "autre_page" | "date" | "signature" | "couleur" | "done";
+type EmbedStep = "titre_page" | "texte_page" | "image_page" | "autre_page" | "date" | "signature" | "couleur" | "bouton_role" | "label_bouton_role" | "done";
 type TicketStep = "description" | "bouton" | "couleur" | "done";
 
 interface EmbedSession {
@@ -109,6 +124,8 @@ interface EmbedSession {
   couleur?: string;
   step: EmbedStep;
   editing: boolean;        // true = modification, false = création
+  roleId?: string;         // ID du rôle à donner via bouton
+  roleBoutonLabel?: string; // label du bouton de rôle
 }
 
 interface TicketSession {
@@ -159,7 +176,8 @@ function buildHelpPages(): EmbedBuilder[] {
       { name: "+warn @membre [raison]", value: "Donner un avertissement.", inline: false },
       { name: "+unwarn @membre [id]", value: "Retirer un warn. Sans ID = tout supprimer.", inline: false },
       { name: "+warnlist @membre", value: "Voir les avertissements d'un membre.", inline: false },
-      { name: "+mute @membre <durée> <s|m|h|j> [raison]", value: "Muter un membre. Ex : `+mute @user 10 m Spam`", inline: false },
+      { name: "+mute @membre [raison]", value: "Muter un membre de façon permanente (jusqu'à +unmute).", inline: false },
+      { name: "+tempmute @membre <durée> <s|m|h|j> [raison]", value: "Muter temporairement. Ex : `+tempmute @user 10 m Spam`", inline: false },
       { name: "+unmute @membre", value: "Retirer le mute d'un membre.", inline: false },
       { name: "+kick @membre [raison]", value: "Expulser un membre.", inline: false },
       { name: "+ban @membre [raison]", value: "Bannir un membre.", inline: false },
@@ -190,14 +208,21 @@ function buildHelpPages(): EmbedBuilder[] {
     .addFields(
       { name: "+antilink on|off", value: "Supprimer automatiquement les liens.", inline: false },
       { name: "+antispam on|off [seuil] [intervalle]", value: "Muter automatiquement les spammeurs.\nEx : `+antispam on 5 3`", inline: false },
-      { name: "+antiraid on|off [seuil]", value: "Lockdown auto si trop de joins en 10s.\nEx : `+antiraid on 10`", inline: false },
-      { name: "+antiraid-reset", value: "Désactiver manuellement le lockdown.", inline: false },
+      { name: "+antiraid on|off [seuil]", value: "Lockdown auto si trop de joins en 10s.", inline: false },
+      { name: "+antiraid-reset", value: "Désactiver manuellement le lockdown anti-raid.", inline: false },
+      { name: "+antiaddbot on|off", value: "Empêcher l'ajout de bots (seuls owners et whitelist peuvent en ajouter).", inline: false },
+      { name: "+antimentionspam on|off [seuil]", value: "Muter auto les mass-mentions.\nEx : `+antimentionspam on 5`", inline: false },
+      { name: "+slowmode [#salon] <secondes>", value: "Activer un slowmode. `0` pour désactiver.", inline: false },
+      { name: "+lockdown [raison]", value: "Verrouiller TOUS les salons d'urgence.", inline: false },
+      { name: "+unlockdown", value: "Déverrouiller tous les salons.", inline: false },
+      { name: "+massban <id1> <id2> ... [raison]", value: "Bannir plusieurs personnes d'un coup par ID.", inline: false },
+      { name: "+clearinvites", value: "Supprimer toutes les invitations du serveur.", inline: false },
     ).setFooter(footer);
 
   const p4 = new EmbedBuilder().setColor(COLOR.dark).setTitle("⚙️ Aide (4/6) · Configuration")
     .setDescription("Commandes pour configurer le bot.")
     .addFields(
-      { name: "+setrole <1-5> @rôle", value: "Associer un rôle à un niveau de permission.\nEx : `+setrole 2 @Modérateur`", inline: false },
+      { name: "+setrole <1-6> @rôle", value: "Associer un rôle à un niveau (1=Helpeur, 2=Modo, 3=Chef Modo, 4=Responsable, 5=Co Owner, 6=Paix).\nEx : `+setrole 2 @Modo`", inline: false },
       { name: "+perm", value: "Voir les rôles associés à chaque niveau.", inline: false },
       { name: "+config", value: "Voir la configuration complète.", inline: false },
       { name: "+owner add @personne", value: "Ajouter un owner (perm 5 permanente).", inline: false },
@@ -238,8 +263,8 @@ function buildHelpPages(): EmbedBuilder[] {
 // CLIENT
 // ══════════════════════════════════════════════════════════════════════════════
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildModeration],
-  partials: [Partials.Channel, Partials.Message],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildModeration, GatewayIntentBits.GuildIntegrations],
+  partials: [Partials.Channel, Partials.Message, Partials.GuildMember],
 });
 
 client.once(Events.ClientReady, readyClient => {
@@ -297,6 +322,24 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     return;
   }
 
+  // Toggle rôle via bouton embed
+  if (customId.startsWith("toggle_role_")) {
+    if (!interaction.guild) return;
+    const roleId = customId.replace("toggle_role_", "");
+    const role = interaction.guild.roles.cache.get(roleId);
+    if (!role) { await interaction.reply({ content: "❌ Rôle introuvable.", ephemeral: true }); return; }
+    const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+    if (!member) return;
+    if (member.roles.cache.has(role.id)) {
+      await member.roles.remove(role);
+      await interaction.reply({ content: `✅ Rôle **${role.name}** retiré.`, ephemeral: true });
+    } else {
+      await member.roles.add(role);
+      await interaction.reply({ content: `✅ Rôle **${role.name}** attribué.`, ephemeral: true });
+    }
+    return;
+  }
+
   // Fermeture d'un ticket
   if (customId.startsWith("ticket_close_")) {
     if (!interaction.guild) return;
@@ -319,6 +362,51 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
 client.on(Events.GuildMemberAdd, async (member: GuildMember) => {
   if (isBlacklisted(member.id)) { await member.ban({ reason: "Blacklisté — auto-ban" }).catch(() => null); return; }
   await handleAntiRaid(member);
+  // Log entrée
+  await sendLog(member.guild, "joins-leaves", new EmbedBuilder().setColor(COLOR.green)
+    .setTitle("📥 Membre rejoint")
+    .setThumbnail(member.user.displayAvatarURL())
+    .addFields(
+      { name: "Membre", value: `${member.user.tag} (${member.id})`, inline: true },
+      { name: "Compte créé", value: `<t:${Math.floor(member.user.createdTimestamp/1000)}:R>`, inline: true },
+    ).setTimestamp());
+});
+
+client.on(Events.GuildMemberRemove, async (member) => {
+  await sendLog((member as GuildMember).guild, "joins-leaves", new EmbedBuilder().setColor(COLOR.red)
+    .setTitle("📤 Membre parti")
+    .setThumbnail(member.user?.displayAvatarURL() ?? null)
+    .addFields({ name: "Membre", value: `${member.user?.tag ?? "Inconnu"} (${member.id})`, inline: true })
+    .setTimestamp());
+});
+
+client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
+  const added = newMember.roles.cache.filter(r => !oldMember.roles.cache.has(r.id));
+  const removed = oldMember.roles.cache.filter(r => !newMember.roles.cache.has(r.id));
+  if (added.size === 0 && removed.size === 0) return;
+  const lines: string[] = [];
+  added.forEach(r => lines.push(`✅ Ajouté : **${r.name}**`));
+  removed.forEach(r => lines.push(`❌ Retiré : **${r.name}**`));
+  await sendLog(newMember.guild, "role-changes", new EmbedBuilder().setColor(COLOR.blue)
+    .setTitle("🏷️ Changement de rôles")
+    .addFields({ name: "Membre", value: `${newMember.user.tag} (${newMember.id})`, inline: true }, { name: "Changements", value: lines.join("\n"), inline: false })
+    .setTimestamp());
+});
+
+// Anti-add bot : kick les bots ajoutés si antiaddbot est activé
+client.on(Events.GuildIntegrationsUpdate, async (guild) => {
+  const config = getConfig();
+  if (!config.antiaddbot) return;
+  // Trouver les bots récemment ajoutés
+  const bots = guild.members.cache.filter(m => m.user.bot && m.joinedTimestamp && Date.now() - m.joinedTimestamp < 10000);
+  for (const [, bot] of bots) {
+    if (isOwner(bot.id) || isWhitelisted(bot.id)) continue; // perm5 handled via owner check
+    await bot.kick("Anti-add bot activé").catch(() => null);
+    await sendLog(guild, "logs", new EmbedBuilder().setColor(COLOR.red)
+      .setTitle("🤖 Bot expulsé — Anti-add bot")
+      .addFields({ name: "Bot", value: `${bot.user.tag} (${bot.id})`, inline: true })
+      .setTimestamp());
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -375,17 +463,43 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
       } else if (s.step === "couleur") {
         s.couleur = response.toLowerCase() !== "non" ? response : "#5865f2";
+        s.step = "bouton_role";
+        await message.reply({ embeds: [askEmbed("Veux-tu ajouter un **bouton de rôle** ? (mentionne le rôle avec @, ou tape `non`)
+En cliquant dessus, les membres recevront/retireront le rôle automatiquement.")] });
+
+      } else if (s.step === "bouton_role") {
+        if (response.toLowerCase() === "non") {
+          s.step = "done";
+          sessions.delete(sKey);
+          if (s.editing) {
+            updateEmbed(s.titre, { pages: s.pages, afficherDate: s.afficherDate!, signature: s.signature, couleur: s.couleur, roleId: undefined, roleBoutonLabel: undefined });
+          } else {
+            createEmbed({ titre: s.titre, pages: s.pages, afficherDate: s.afficherDate!, signature: s.signature, couleur: s.couleur!, createdAt: new Date().toISOString(), createdBy: message.author.tag });
+          }
+          await message.reply({ embeds: [successEmbed(`Embed **${s.titre}** ${s.editing ? "modifié" : "créé"} ! Poste-le avec \`+embed ${s.titre}\`.`)] });
+          await message.channel.send({ embeds: [buildFinalEmbed(s, 0)] });
+        } else {
+          // Extraire l'ID du rôle mentionné
+          const roleMatch = response.match(/<@&(\d+)>/);
+          if (!roleMatch) {
+            await message.reply({ embeds: [askEmbed("Mentionne un rôle avec @ ou tape `non`.")] });
+          } else {
+            s.roleId = roleMatch[1];
+            s.step = "label_bouton_role";
+            await message.reply({ embeds: [askEmbed("Quel **label** pour le bouton ? (ex: `✅ Accepter le règlement`)")] });
+          }
+        }
+
+      } else if (s.step === "label_bouton_role") {
+        s.roleBoutonLabel = response;
         s.step = "done";
         sessions.delete(sKey);
-
         if (s.editing) {
-          updateEmbed(s.titre, { pages: s.pages, afficherDate: s.afficherDate!, signature: s.signature, couleur: s.couleur });
-          await message.reply({ embeds: [successEmbed(`Embed **${s.titre}** modifié ! Poste-le avec \`+embed ${s.titre}\`.`)] });
+          updateEmbed(s.titre, { pages: s.pages, afficherDate: s.afficherDate!, signature: s.signature, couleur: s.couleur, roleId: s.roleId, roleBoutonLabel: s.roleBoutonLabel });
         } else {
-          createEmbed({ titre: s.titre, pages: s.pages, afficherDate: s.afficherDate!, signature: s.signature, couleur: s.couleur, createdAt: new Date().toISOString(), createdBy: message.author.tag });
-          await message.reply({ embeds: [successEmbed(`Embed **${s.titre}** créé ! Poste-le avec \`+embed ${s.titre}\`.`)] });
+          createEmbed({ titre: s.titre, pages: s.pages, afficherDate: s.afficherDate!, signature: s.signature, couleur: s.couleur!, roleId: s.roleId, roleBoutonLabel: s.roleBoutonLabel, createdAt: new Date().toISOString(), createdBy: message.author.tag });
         }
-        // Aperçu de la première page
+        await message.reply({ embeds: [successEmbed(`Embed **${s.titre}** ${s.editing ? "modifié" : "créé"} avec bouton de rôle ! Poste-le avec \`+embed ${s.titre}\`.`)] });
         await message.channel.send({ embeds: [buildFinalEmbed(s, 0)] });
       }
 
@@ -428,7 +542,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
   }
 
   // Anti-spam/link si pas une commande
-  if (!message.content.startsWith(PREFIX)) { await handleAntiSpam(message); return; }
+  if (!message.content.startsWith(PREFIX)) {
+    // Perm 5 members bypass antispam/antilink automatically
+    const senderPerm = await getPermLevel(message.guild, message.author.id);
+    if (senderPerm < 6) await handleAntiSpam(message);
+    return;
+  }
 
   const config = getConfig();
   const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
@@ -436,7 +555,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
   const guild = message.guild;
   const permLevel = await getPermLevel(guild, message.author.id);
 
-  if (config.maintenanceMode && permLevel < 4 && cmd !== "help" && cmd !== "perm") {
+  if (config.maintenanceMode && permLevel < 5 && cmd !== "help" && cmd !== "perm") {
     await message.reply({ embeds: [new EmbedBuilder().setColor(COLOR.yellow).setTitle("🔧 Bot en maintenance").setDescription(config.maintenanceMessage).setTimestamp()] });
     return;
   }
@@ -455,9 +574,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
   // ── +perm ──────────────────────────────────────────────────────────────────
   if (cmd === "perm") {
     const cfg = getServerConfig();
-    const lines = ([1,2,3,4,5] as const).map(n => {
+    const lines = ([1,2,3,4,5,6] as const).map(n => {
       const id = cfg.roles[`perm${n}` as keyof RolesConfig];
-      return `${["🟢 Perm 1","🔵 Perm 2","🟡 Perm 3","🔴 Perm 4","⚫ Perm 5"][n-1]} → ${id ? `<@&${id}>` : "*(non configuré)*"}`;
+      return `${["🟢 Perm 1 — Helpeur","🔵 Perm 2 — Modo","🟡 Perm 3 — Chef Modo","🔴 Perm 4 — Responsable","🟠 Perm 5 — Co Owner","⚫ Perm 6 — Paix"][n-1]} → ${id ? `<@&${id}>` : "*(non configuré)*"}`;
     });
     await message.reply({ embeds: [new EmbedBuilder().setColor(COLOR.blue).setTitle("🔑 Permissions").setDescription(lines.join("\n")).setFooter({ text: "+setrole <1-5> @rôle pour configurer" }).setTimestamp()] });
     return;
@@ -465,9 +584,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   // ── +config ────────────────────────────────────────────────────────────────
   if (cmd === "config") {
-    if (permLevel < 5) { await noPerm(); return; }
+    if (permLevel < 6) { await noPerm(); return; }
     const cfg = getServerConfig();
-    const roles = ([1,2,3,4,5] as const).map(n => { const id = cfg.roles[`perm${n}` as keyof RolesConfig]; return `Perm ${n} : ${id ? `<@&${id}>` : "*(non défini)*"}`; }).join("\n");
+    const roles = ([1,2,3,4,5,6] as const).map(n => { const id = cfg.roles[`perm${n}` as keyof RolesConfig]; return `Perm ${n} : ${id ? `<@&${id}>` : "*(non défini)*"}`; }).join("\n");
     const logs = LOG_TYPES.map(k => `${LOG_LABELS[k]} : ${cfg.logs[k] ? `<#${cfg.logs[k]}>` : "*(non défini)*"}`).join("\n");
     await message.reply({ embeds: [new EmbedBuilder().setColor(COLOR.dark).setTitle("⚙️ Configuration").addFields({ name: "Rôles", value: roles }, { name: "Salons de logs", value: logs }).setTimestamp()] });
     return;
@@ -475,7 +594,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   // ── +setrole ───────────────────────────────────────────────────────────────
   if (cmd === "setrole") {
-    if (permLevel < 5) { await noPerm(); return; }
+    if (permLevel < 6) { await noPerm(); return; }
     const lvl = parseInt(args[0] ?? "", 10);
     if (isNaN(lvl) || lvl < 1 || lvl > 5) { await message.reply({ embeds: [errEmbed("Usage : `+setrole <1-5> @rôle`")] }); return; }
     const role = message.mentions.roles.first();
@@ -489,7 +608,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   // ── +logs ──────────────────────────────────────────────────────────────────
   if (cmd === "logs") {
-    if (permLevel < 5) { await noPerm(); return; }
+    if (permLevel < 6) { await noPerm(); return; }
     const cfg = getServerConfig();
     const lines = LOG_TYPES.map(k => `${LOG_LABELS[k]} → ${cfg.logs[k] ? `<#${cfg.logs[k]}>` : "*(non configuré)*"}`).join("\n");
     await message.reply({ embeds: [new EmbedBuilder().setColor(COLOR.blue).setTitle("📋 Salons de logs").setDescription(lines).setFooter({ text: "+addlogs <type> #salon" }).setTimestamp()] });
@@ -498,7 +617,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   // ── +addlogs ───────────────────────────────────────────────────────────────
   if (cmd === "addlogs") {
-    if (permLevel < 5) { await noPerm(); return; }
+    if (permLevel < 6) { await noPerm(); return; }
     const key = args[0]?.toLowerCase() as keyof LogsConfig;
     if (!key || !LOG_TYPES.includes(key)) { await message.reply({ embeds: [errEmbed(`Type invalide. Types : \`${LOG_TYPES.join(", ")}\``)] }); return; }
     const channel = message.mentions.channels.first();
@@ -512,7 +631,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   // ── +deletelogs ────────────────────────────────────────────────────────────
   if (cmd === "deletelogs") {
-    if (permLevel < 5) { await noPerm(); return; }
+    if (permLevel < 6) { await noPerm(); return; }
     const key = args[0]?.toLowerCase() as keyof LogsConfig;
     if (!key || !LOG_TYPES.includes(key)) { await message.reply({ embeds: [errEmbed(`Type invalide. Types : \`${LOG_TYPES.join(", ")}\``)] }); return; }
     const cfg = getServerConfig();
@@ -524,7 +643,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   // ── +modiflogs ─────────────────────────────────────────────────────────────
   if (cmd === "modiflogs") {
-    if (permLevel < 5) { await noPerm(); return; }
+    if (permLevel < 6) { await noPerm(); return; }
     const key = args[0]?.toLowerCase() as keyof LogsConfig;
     if (!key || !LOG_TYPES.includes(key)) { await message.reply({ embeds: [errEmbed(`Type invalide. Types : \`${LOG_TYPES.join(", ")}\``)] }); return; }
     const channel = message.mentions.channels.first();
@@ -583,23 +702,42 @@ client.on(Events.MessageCreate, async (message: Message) => {
     return;
   }
 
-  // ── +mute ──────────────────────────────────────────────────────────────────
+  // ── +mute @membre [raison] — mute permanent ───────────────────────────────
   if (cmd === "mute") {
     if (permLevel < 1) { await noPerm(); return; }
     const target = message.mentions.users.first();
-    if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+mute @membre <durée> <s|m|h|j> [raison]`")] }); return; }
+    if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+mute @membre [raison]`")] }); return; }
+    const raison = args.slice(1).join(" ") || "Aucune raison fournie";
+    const member = await guild.members.fetch(target.id).catch(() => null);
+    if (!member?.moderatable) { await message.reply({ embeds: [errEmbed("Impossible de muter ce membre.")] }); return; }
+    // Mute permanent = timeout max Discord (28 jours) renouvelable — on stocke pour le rendre "permanent"
+    await member.timeout(28 * 24 * 3600000, raison);
+    await message.reply({ embeds: [successEmbed(`**${target.tag}** muté de façon permanente. Utilise \`+unmute\` pour lever.`)] });
+    await sendLog(guild, "mute-unmute", new EmbedBuilder().setColor(COLOR.orange).setTitle("🔇 Mute permanent")
+      .addFields({ name: "Utilisateur", value: `${target.tag} (${target.id})`, inline: true }, { name: "Modérateur", value: message.author.tag, inline: true }, { name: "Raison", value: raison }).setTimestamp());
+    return;
+  }
+
+  // ── +tempmute @membre <durée> <s|m|h|j> [raison] — mute temporaire ────────
+  if (cmd === "tempmute") {
+    if (permLevel < 1) { await noPerm(); return; }
+    const target = message.mentions.users.first();
+    if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+tempmute @membre <durée> <s|m|h|j> [raison]`\nEx : `+tempmute @user 10 m Spam`")] }); return; }
     const valeur = parseInt(args[1] ?? "", 10);
     const unite = args[2]?.toLowerCase();
     const msMap: Record<string,number> = { s:1000, m:60000, h:3600000, j:86400000 };
-    if (isNaN(valeur) || valeur < 1 || !unite || !msMap[unite]) { await message.reply({ embeds: [errEmbed("Unités : `s` `m` `h` `j`")] }); return; }
+    if (isNaN(valeur) || valeur < 1 || !unite || !msMap[unite]) {
+      await message.reply({ embeds: [errEmbed("Usage : `+tempmute @membre <durée> <s|m|h|j> [raison]`\nUnités : `s` secondes, `m` minutes, `h` heures, `j` jours")] }); return;
+    }
     const totalMs = valeur * msMap[unite]!;
-    if (totalMs > 28*24*3600000) { await message.reply({ embeds: [errEmbed("Max : 28 jours.")] }); return; }
+    if (totalMs > 28*24*3600000) { await message.reply({ embeds: [errEmbed("Durée max : 28 jours.")] }); return; }
     const raison = args.slice(3).join(" ") || "Aucune raison fournie";
     const member = await guild.members.fetch(target.id).catch(() => null);
     if (!member?.moderatable) { await message.reply({ embeds: [errEmbed("Impossible de muter ce membre.")] }); return; }
     await member.timeout(totalMs, raison);
-    await message.reply({ embeds: [successEmbed(`**${target.tag}** muté pour ${valeur}${unite}.`)] });
-    await sendLog(guild, "mute-unmute", new EmbedBuilder().setColor(COLOR.orange).setTitle("🔇 Mute").addFields({ name: "Utilisateur", value: `${target.tag}`, inline: true }, { name: "Modérateur", value: message.author.tag, inline: true }, { name: "Durée", value: `${valeur}${unite}`, inline: true }, { name: "Raison", value: raison }).setTimestamp());
+    await message.reply({ embeds: [successEmbed(`**${target.tag}** muté temporairement pour **${valeur}${unite}**.`)] });
+    await sendLog(guild, "mute-unmute", new EmbedBuilder().setColor(COLOR.orange).setTitle("🔇 Tempmute")
+      .addFields({ name: "Utilisateur", value: `${target.tag} (${target.id})`, inline: true }, { name: "Modérateur", value: message.author.tag, inline: true }, { name: "Durée", value: `${valeur}${unite}`, inline: true }, { name: "Raison", value: raison }).setTimestamp());
     return;
   }
 
@@ -801,8 +939,11 @@ client.on(Events.MessageCreate, async (message: Message) => {
       await message.reply({ embeds: [successEmbed(`**${target.tag}** retiré de la whitelist.`)] });
     } else if (sub === "check") {
       const list = getWhitelist();
-      if (list.length === 0) { await message.reply({ embeds: [okEmbed("✅ Whitelist", "La whitelist est vide.")] }); return; }
-      const desc = list.map((e,i) => `**${i+1}.** ${e.tag} (\`${e.id}\`)`).join("\n");
+      const cfg = getServerConfig();
+      const perm5RoleId = cfg.roles.perm6;
+      const autoNote = perm5RoleId ? `\n\n*Les membres avec le rôle <@&${perm5RoleId}> (perm 6 — paix) sont automatiquement whitelistés.*` : "";
+      if (list.length === 0) { await message.reply({ embeds: [okEmbed("✅ Whitelist", `La whitelist manuelle est vide.${autoNote}`)] }); return; }
+      const desc = list.map((e,i) => `**${i+1}.** ${e.tag} (\`${e.id}\`)`).join("\n") + autoNote;
       await message.reply({ embeds: [new EmbedBuilder().setColor(COLOR.green).setTitle(`✅ Whitelist (${list.length})`).setDescription(desc).setTimestamp()] });
     } else { await message.reply({ embeds: [errEmbed("Usage : `+wl add|remove|check`")] }); }
     return;
@@ -841,7 +982,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   // ── +antilink ──────────────────────────────────────────────────────────────
   if (cmd === "antilink") {
-    if (permLevel < 5) { await noPerm(); return; }
+    if (permLevel < 6) { await noPerm(); return; }
     const on = args[0]?.toLowerCase() === "on";
     updateConfig({ antilink: on });
     await message.reply({ embeds: [successEmbed(`Antilink ${on ? "activé" : "désactivé"}.`)] });
@@ -851,7 +992,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   // ── +antispam ──────────────────────────────────────────────────────────────
   if (cmd === "antispam") {
-    if (permLevel < 5) { await noPerm(); return; }
+    if (permLevel < 6) { await noPerm(); return; }
     const on = args[0]?.toLowerCase() === "on";
     const seuil = args[1] ? parseInt(args[1],10) : undefined;
     const intervalle = args[2] ? parseInt(args[2],10) : undefined;
@@ -863,7 +1004,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   // ── +antiraid ──────────────────────────────────────────────────────────────
   if (cmd === "antiraid") {
-    if (permLevel < 5) { await noPerm(); return; }
+    if (permLevel < 6) { await noPerm(); return; }
     const on = args[0]?.toLowerCase() === "on";
     const seuil = args[1] ? parseInt(args[1],10) : undefined;
     updateConfig({ antiraid: on, ...(seuil && !isNaN(seuil) && { antiraidThreshold: seuil }) });
@@ -874,7 +1015,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
   // ── +antiraid-reset ────────────────────────────────────────────────────────
   if (cmd === "antiraid-reset") {
-    if (permLevel < 5) { await noPerm(); return; }
+    if (permLevel < 6) { await noPerm(); return; }
     if (!isRaidLockdown()) { await message.reply({ embeds: [errEmbed("Aucun lockdown actif.")] }); return; }
     disableRaidLockdown();
     await message.reply({ embeds: [successEmbed("Lockdown désactivé.")] });
@@ -882,13 +1023,113 @@ client.on(Events.MessageCreate, async (message: Message) => {
     return;
   }
 
+  // ── +antiaddbot on|off ────────────────────────────────────────────────────
+  if (cmd === "antiaddbot") {
+    if (permLevel < 6) { await noPerm(); return; }
+    const statut = args[0]?.toLowerCase();
+    if (statut !== "on" && statut !== "off") { await message.reply({ embeds: [errEmbed("Usage : `+antiaddbot on|off`")] }); return; }
+    const on = statut === "on";
+    updateConfig({ antiaddbot: on });
+    await message.reply({ embeds: [successEmbed(`Anti-add bot ${on ? "activé — seuls les owners et la whitelist peuvent ajouter des bots" : "désactivé"}.`)] });
+    await sendLog(guild, "logs", new EmbedBuilder().setColor(on ? COLOR.red : COLOR.green).setTitle(`🤖 Anti-add bot ${on ? "activé" : "désactivé"}`).addFields({ name: "Par", value: message.author.tag }).setTimestamp());
+    return;
+  }
+
+  // ── +slowmode #salon <secondes> ───────────────────────────────────────────
+  if (cmd === "slowmode") {
+    if (permLevel < 3) { await noPerm(); return; }
+    const targetChan = (message.mentions.channels.first() as TextChannel | undefined) ?? message.channel as TextChannel;
+    const secondes = parseInt(args.find(a => !a.startsWith("<")) ?? "", 10);
+    if (isNaN(secondes) || secondes < 0 || secondes > 21600) { await message.reply({ embeds: [errEmbed("Usage : `+slowmode [#salon] <0-21600>`
+`0` pour désactiver.")] }); return; }
+    await targetChan.setRateLimitPerUser(secondes);
+    await message.reply({ embeds: [successEmbed(secondes === 0 ? `Slowmode désactivé sur **#${targetChan.name}**.` : `Slowmode de **${secondes}s** activé sur **#${targetChan.name}**.`)] });
+    await sendLog(guild, "logs", new EmbedBuilder().setColor(secondes === 0 ? COLOR.green : COLOR.orange).setTitle("🐢 Slowmode").addFields({ name: "Salon", value: `#${targetChan.name}`, inline: true }, { name: "Durée", value: `${secondes}s`, inline: true }, { name: "Par", value: message.author.tag, inline: true }).setTimestamp());
+    return;
+  }
+
+  // ── +lockdown [raison] ────────────────────────────────────────────────────
+  if (cmd === "lockdown") {
+    if (permLevel < 4) { await noPerm(); return; }
+    const raison = args.join(" ") || "Lockdown d'urgence";
+    const channels = guild.channels.cache.filter(c => c instanceof TextChannel) as Collection<string, TextChannel>;
+    let count = 0;
+    for (const [, chan] of channels) {
+      await chan.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }).catch(() => null);
+      count++;
+    }
+    await message.reply({ embeds: [successEmbed(`🔒 **${count} salons** verrouillés. Raison : ${raison}`)] });
+    await sendLog(guild, "logs", new EmbedBuilder().setColor(COLOR.darkred).setTitle("🔒 LOCKDOWN ACTIVÉ").addFields({ name: "Par", value: message.author.tag, inline: true }, { name: "Salons", value: `${count}`, inline: true }, { name: "Raison", value: raison }).setTimestamp());
+    return;
+  }
+
+  // ── +unlockdown ───────────────────────────────────────────────────────────
+  if (cmd === "unlockdown") {
+    if (permLevel < 4) { await noPerm(); return; }
+    const channels = guild.channels.cache.filter(c => c instanceof TextChannel) as Collection<string, TextChannel>;
+    let count = 0;
+    for (const [, chan] of channels) {
+      await chan.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: null }).catch(() => null);
+      count++;
+    }
+    await message.reply({ embeds: [successEmbed(`🔓 **${count} salons** déverrouillés.`)] });
+    await sendLog(guild, "logs", new EmbedBuilder().setColor(COLOR.green).setTitle("🔓 LOCKDOWN LEVÉ").addFields({ name: "Par", value: message.author.tag, inline: true }, { name: "Salons", value: `${count}`, inline: true }).setTimestamp());
+    return;
+  }
+
+  // ── +massban <id1> <id2> ... [raison] ─────────────────────────────────────
+  if (cmd === "massban") {
+    if (permLevel < 4) { await noPerm(); return; }
+    const ids = args.filter(a => /^\d{17,19}$/.test(a));
+    const raison = args.filter(a => !/^\d{17,19}$/.test(a)).join(" ") || "Massban";
+    if (ids.length === 0) { await message.reply({ embeds: [errEmbed("Usage : `+massban <id1> <id2> ... [raison]`")] }); return; }
+    let success = 0;
+    for (const id of ids) {
+      await guild.bans.create(id, { reason: raison }).catch(() => null);
+      success++;
+    }
+    await message.reply({ embeds: [successEmbed(`**${success}** membres bannis. Raison : ${raison}`)] });
+    await sendLog(guild, "bans-deban", new EmbedBuilder().setColor(COLOR.darkred).setTitle("🔨 Massban").addFields({ name: "Bans", value: `${success}`, inline: true }, { name: "Par", value: message.author.tag, inline: true }, { name: "Raison", value: raison }).setTimestamp());
+    return;
+  }
+
+  // ── +clearinvites ─────────────────────────────────────────────────────────
+  if (cmd === "clearinvites") {
+    if (permLevel < 4) { await noPerm(); return; }
+    const invites = await guild.invites.fetch().catch(() => null);
+    if (!invites || invites.size === 0) { await message.reply({ embeds: [okEmbed("🔗 Invitations", "Aucune invitation active.")] }); return; }
+    let count = 0;
+    for (const [, invite] of invites) {
+      await invite.delete("Clearinvites").catch(() => null);
+      count++;
+    }
+    await message.reply({ embeds: [successEmbed(`**${count}** invitation(s) supprimée(s).`)] });
+    await sendLog(guild, "logs", new EmbedBuilder().setColor(COLOR.orange).setTitle("🔗 Clearinvites").addFields({ name: "Supprimées", value: `${count}`, inline: true }, { name: "Par", value: message.author.tag, inline: true }).setTimestamp());
+    return;
+  }
+
+  // ── +antimentionspam on|off [seuil] ───────────────────────────────────────
+  if (cmd === "antimentionspam") {
+    if (permLevel < 6) { await noPerm(); return; }
+    const statut = args[0]?.toLowerCase();
+    if (statut !== "on" && statut !== "off") { await message.reply({ embeds: [errEmbed("Usage : `+antimentionspam on|off [seuil]`
+Ex: `+antimentionspam on 5`")] }); return; }
+    const on = statut === "on";
+    const seuil = args[1] ? parseInt(args[1], 10) : undefined;
+    updateConfig({ antimentionspam: on, ...(seuil && !isNaN(seuil) && { antimentionspamThreshold: seuil }) });
+    await message.reply({ embeds: [successEmbed(`Anti-mention spam ${on ? `activé (seuil : ${seuil ?? getConfig().antimentionspamThreshold ?? 5} mentions)` : "désactivé"}.`)] });
+    await sendLog(guild, "logs", new EmbedBuilder().setColor(on ? COLOR.orange : COLOR.green).setTitle(`📢 Anti-mention spam ${on ? "activé" : "désactivé"}`).addFields({ name: "Par", value: message.author.tag }).setTimestamp());
+    return;
+  }
+
   // ── +owner ─────────────────────────────────────────────────────────────────
   if (cmd === "owner") {
-    if (permLevel < 5) { await noPerm(); return; }
+    if (permLevel < 6) { await noPerm(); return; }
     const sub = args[0]?.toLowerCase();
     if (sub === "add") {
       const target = message.mentions.users.first();
       if (!target) { await message.reply({ embeds: [errEmbed("Usage : `+owner add @personne`")] }); return; }
+      if (target.id === message.author.id) { await message.reply({ embeds: [errEmbed("Tu ne peux pas te mettre owner toi-même.")] }); return; }
       if (isOwner(target.id)) { await message.reply({ embeds: [errEmbed(`**${target.tag}** est déjà owner.`)] }); return; }
       addOwner({ id: target.id, tag: target.tag, addedAt: new Date().toISOString(), addedBy: message.author.tag });
       await message.reply({ embeds: [successEmbed(`**${target.tag}** ajouté comme owner.`)] });
@@ -900,8 +1141,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
       await message.reply({ embeds: [successEmbed(`**${target.tag}** retiré des owners.`)] });
     } else if (sub === "list") {
       const owners = getOwners();
-      if (owners.length === 0) { await message.reply({ embeds: [okEmbed("👑 Owners", "Aucun owner.")] }); return; }
-      await message.reply({ embeds: [new EmbedBuilder().setColor(COLOR.dark).setTitle(`👑 Owners (${owners.length})`).setDescription(owners.map((o,i) => `**${i+1}.** ${o.tag} (\`${o.id}\`)`).join("\n")).setTimestamp()] });
+      const cfg = getServerConfig();
+      const perm5RoleId = cfg.roles.perm6;
+      const autoNote = perm5RoleId ? `\n\n*Les membres avec le rôle <@&${perm5RoleId}> (perm 6 — paix) sont automatiquement owners.*` : "";
+      if (owners.length === 0) { await message.reply({ embeds: [okEmbed("👑 Owners", `Aucun owner manuel enregistré.${autoNote}`)] }); return; }
+      const desc = owners.map((o,i) => `**${i+1}.** ${o.tag} (\`${o.id}\`)`).join("\n") + autoNote;
+      await message.reply({ embeds: [new EmbedBuilder().setColor(COLOR.dark).setTitle(`👑 Owners manuels (${owners.length})`).setDescription(desc).setTimestamp()] });
     } else { await message.reply({ embeds: [errEmbed("Usage : `+owner add|remove|list`")] }); }
     return;
   }
@@ -948,7 +1193,15 @@ client.on(Events.MessageCreate, async (message: Message) => {
       if (entry.pages.length > 1) footerParts.push(`Page ${i+1}/${entry.pages.length}`);
       if (entry.signature) footerParts.push(entry.signature);
       if (footerParts.length) e.setFooter({ text: footerParts.join(" • ") });
-      await message.channel.send({ embeds: [e] });
+      // Bouton de rôle uniquement sur la dernière page
+      if (entry.roleId && entry.roleBoutonLabel && i === entry.pages.length - 1) {
+        const roleRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(`toggle_role_${entry.roleId}`).setLabel(entry.roleBoutonLabel).setStyle(ButtonStyle.Success)
+        );
+        await message.channel.send({ embeds: [e], components: [roleRow] });
+      } else {
+        await message.channel.send({ embeds: [e] });
+      }
     }
     return;
   }
